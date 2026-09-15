@@ -207,18 +207,76 @@ def sub_keyboard_event(event, *args, **kwargs) -> bool:
                 custom_rl_env.base_command[str(i)] = [0, 0, 0]
     return True
 
+import os
 
 def setup_custom_env():
+    if args_cli.terrain != 'flat':
+        return
+    usd_path = f"./envs/{args_cli.custom_env}.usd"
+    if not os.path.isfile(usd_path):
+        print(f"[go2_omniverse] custom env usd not found: {usd_path}")
+        return
     try:
-        if (args_cli.custom_env == "warehouse" and args_cli.terrain == 'flat'):
-            cfg_scene = sim_utils.UsdFileCfg(usd_path="./envs/warehouse.usd")
-            cfg_scene.func("/World/warehouse", cfg_scene, translation=(0.0, 0.0, 0.0))
+        cfg_scene = sim_utils.UsdFileCfg(usd_path=usd_path)
+        cfg_scene.func(f"/World/{args_cli.custom_env}", cfg_scene, translation=(0.0, 0.0, 0.0))
 
-        if (args_cli.custom_env == "office" and args_cli.terrain == 'flat'):
-            cfg_scene = sim_utils.UsdFileCfg(usd_path="./envs/office.usd")
-            cfg_scene.func("/World/office", cfg_scene, translation=(0.0, 0.0, 0.0))
-    except:
-        print("Error loading custom environment. You should download custom envs folder from: https://drive.google.com/drive/folders/1vVGuO1KIX1K6mD6mBHDZGm9nk2vaRyj3?usp=sharing")
+        from pxr import Usd, UsdGeom, UsdPhysics
+        import omni.usd
+        import numpy as np
+
+        stage = omni.usd.get_context().get_stage()
+        root_prim = stage.GetPrimAtPath(f"/World/{args_cli.custom_env}")
+        mesh_prims = []
+        for prim in Usd.PrimRange(root_prim):
+            if prim.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(prim)
+                mesh_prims.append(prim)
+
+        # RayCaster (isaaclab/sensors/ray_caster/ray_caster.py) only reads the FIRST Mesh
+        # prim it finds under a given path — it does not merge a subtree with several
+        # separate Mesh prims (common in these envs: floor, ramp steps, walls as distinct
+        # meshes). So height_scanner_env has nothing to point at that reliably covers the
+        # whole scene; build one combined Mesh prim in world space for it to use instead.
+        all_points = []
+        all_tris = []
+        offset = 0
+        for prim in mesh_prims:
+            mesh = UsdGeom.Mesh(prim)
+            pts = np.asarray(mesh.GetPointsAttr().Get())
+            if pts.size == 0:
+                continue
+            counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get())
+            face_indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get())
+            transform = np.array(omni.usd.get_world_transform_matrix(prim)).T
+            pts_world = np.matmul(pts, transform[:3, :3].T) + transform[:3, 3]
+
+            # Fan-triangulate every face. convert_to_warp_mesh() (isaaclab/utils/warp/ops.py,
+            # used by RayCaster to build its collision mesh) requires pure triangle indices,
+            # but USD box/cube primitives are commonly authored as quads (4 verts/face) —
+            # feeding those straight through silently reinterprets every 3 raw index values
+            # as one triangle, scrambling faces into garbage geometry with the right bbox
+            # but wrong internal shape (this is what caused the ~5-10cm phantom bumps).
+            idx = 0
+            for c in counts:
+                c = int(c)
+                face = face_indices[idx: idx + c]
+                for i in range(1, c - 1):
+                    all_tris.append((face[0] + offset, face[i] + offset, face[i + 1] + offset))
+                idx += c
+
+            all_points.append(pts_world)
+            offset += len(pts)
+
+        if all_points:
+            scan_mesh_path = f"/World/{args_cli.custom_env}_scan"
+            scan_mesh = UsdGeom.Mesh.Define(stage, scan_mesh_path)
+            merged_tris = np.array(all_tris, dtype=np.int64)
+            scan_mesh.CreatePointsAttr(np.concatenate(all_points).tolist())
+            scan_mesh.CreateFaceVertexCountsAttr([3] * len(merged_tris))
+            scan_mesh.CreateFaceVertexIndicesAttr(merged_tris.flatten().tolist())
+            UsdGeom.Imageable(scan_mesh.GetPrim()).MakeInvisible()
+    except Exception as e:
+        print(f"[go2_omniverse] Error loading custom environment '{args_cli.custom_env}': {e}")
 
 
 def capture_hero_shots(env, policy, obs, device, n_settle, out_dir):
@@ -365,7 +423,7 @@ def run_sim():
     # parse configuration
     
     env_cfg = UnitreeGo2CustomEnvCfg()
-    
+
     if args_cli.robot == "g1":
         env_cfg = G1RoughEnvCfg()
 
@@ -378,6 +436,11 @@ def run_sim():
 
     if args_cli.robot == "g1":
         agent_cfg = unitree_g1_agent_cfg
+
+    # Must run before gym.make(): height_scanner_env (initialized during env creation)
+    # resolves its mesh_prim_paths immediately and errors out if the custom env's prim
+    # doesn't exist in the stage yet.
+    setup_custom_env()
 
     # create isaac environment
     _ckpt(f"gym.make task={args_cli.task} num_envs={env_cfg.scene.num_envs}")
@@ -438,7 +501,30 @@ def run_sim():
     _ckpt("camera omnigraph skipped (bridge extension disabled for rclpy compat)")
     _ckpt("entering main loop")
 
-    setup_custom_env()
+    # Both height_scanner and height_scanner_env have debug_vis off (see custom_rl_env.py) —
+    # draw the merged result ourselves instead of two independently-drawn, overlapping grids.
+    height_vis = None
+    height_scanner_sensor = env.unwrapped.scene.sensors.get("height_scanner")
+    height_scanner_env_sensor = env.unwrapped.scene.sensors.get("height_scanner_env")
+    if height_scanner_sensor is not None:
+        from isaaclab.markers import VisualizationMarkers
+        from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
+
+        height_vis = VisualizationMarkers(RAY_CASTER_MARKER_CFG.replace(prim_path="/Visuals/HeightScanMerged"))
+
+    def _draw_merged_height_scan():
+        hits = height_scanner_sensor.data.ray_hits_w
+        if height_scanner_env_sensor is not None:
+            hits_env = height_scanner_env_sensor.data.ray_hits_w
+            # higher surface wins: larger world z = closer to a downward-looking sensor.
+            use_env = (~torch.isinf(hits_env[..., 2])) & (
+                torch.isinf(hits[..., 2]) | (hits_env[..., 2] > hits[..., 2])
+            )
+            hits = torch.where(use_env.unsqueeze(-1), hits_env, hits)
+        points = hits.reshape(-1, 3)
+        points = points[~torch.any(torch.isinf(points), dim=1)]
+        if points.numel() > 0:
+            height_vis.visualize(points)
 
     if args_cli.capture > 0:
         capture_hero_shots(env, policy, obs, device, args_cli.capture, args_cli.capture_dir)
@@ -452,6 +538,8 @@ def run_sim():
         with torch.inference_mode():
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
+            if height_vis is not None:
+                _draw_merged_height_scan()
             if twin is not None:
                 # Overwrite physics-stepped state with the real dog's state.
                 # Kinematic playback — bypasses PD/gravity for an exact mirror.

@@ -19,7 +19,7 @@ set -euo pipefail
 # Jazzy launcher: the bundled runtime is what Isaac Sim loads, and mixing an
 # external rclpy in causes typesupport double-loads.
 
-export ISAAC_VENV="${ISAAC_VENV:-$HOME/Sim/isaac-sim-venv}"
+export ISAAC_VENV="${ISAAC_VENV:-$HOME/isaacsim/env_isaaclab}"
 export ISAACLAB_PATH="${ISAACLAB_PATH:-$HOME/Sim/IsaacLab}"
 export OMNI_KIT_ACCEPT_EULA=YES
 

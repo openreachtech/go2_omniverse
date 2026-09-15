@@ -23,6 +23,7 @@
 
 
 import math
+import os
 import torch
 from dataclasses import MISSING
 from typing import Literal
@@ -35,7 +36,7 @@ from isaaclab.utils import configclass
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+from isaaclab.sensors import ContactSensorCfg, RayCaster, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab_assets import UNITREE_GO2_CFG
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -82,6 +83,45 @@ def constant_commands(env: ManagerBasedRLEnvCfg) -> torch.Tensor:
     return tensor_lst
 
 
+class RayCasterSafeVis(RayCaster):
+    """RayCaster whose debug_vis marker draw tolerates an all-miss scan.
+
+    IsaacLab's own RayCaster._debug_vis_callback() calls visualize() with zero points
+    whenever every ray misses (e.g. height_scanner_env when the robot isn't currently
+    standing over the custom env's mesh at all) and VisualizationMarkers.visualize()
+    raises ValueError on an empty input — crashing the sim every frame that happens.
+    """
+
+    def _debug_vis_callback(self, event):
+        if self._data.ray_hits_w is None:
+            return
+        viz_points = self._data.ray_hits_w.reshape(-1, 3)
+        viz_points = viz_points[~torch.any(torch.isinf(viz_points), dim=1)]
+        if viz_points.numel() == 0:
+            return
+        self.ray_visualizer.visualize(viz_points)
+
+
+def height_scan_merged(
+    env: ManagerBasedRLEnvCfg, sensor_cfg: SceneEntityCfg, sensor_cfg_2: SceneEntityCfg, offset: float = 0.5
+) -> torch.Tensor:
+    """Like mdp.height_scan, but merges two RayCasters (RayCaster itself only accepts one
+    mesh_prim_path) by keeping whichever surface each ray hits first — the higher one, i.e.
+    the smaller sensor-to-hit distance. A ray that misses a mesh entirely (e.g. the custom
+    env has no geometry under that point) gets ray_hits_w == +inf there (IsaacLab's documented
+    miss convention, see raycast_mesh() in isaaclab/utils/warp/ops.py) — sensor_z - inf is
+    -inf, which would otherwise always "win" the min() as if it were the closest possible
+    surface, so misses are pinned to +inf distance before merging.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    sensor_2 = env.scene.sensors[sensor_cfg_2.name]
+    dist = sensor.data.pos_w[:, 2].unsqueeze(1) - sensor.data.ray_hits_w[..., 2]
+    hit_z_2 = sensor_2.data.ray_hits_w[..., 2]
+    dist_2 = sensor_2.data.pos_w[:, 2].unsqueeze(1) - hit_z_2
+    dist_2 = torch.where(torch.isinf(hit_z_2), torch.full_like(dist_2, float("inf")), dist_2)
+    return torch.min(dist, dist_2) - offset
+
+
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
@@ -111,7 +151,12 @@ class MySceneCfg(InteractiveSceneCfg):
     # robots
     robot: ArticulationCfg = MISSING
 
+    # debug_vis stays off on both sensors below — each RayCaster draws its own RAW hits
+    # independently, so with two sensors that doubles up into two overlapping marker grids
+    # instead of one that matches what the policy actually sees. run_sim() draws the
+    # merged result (same logic as height_scan_merged()) with a single marker set instead.
     height_scanner = RayCasterCfg(
+        class_type=RayCasterSafeVis,
         prim_path="{ENV_REGEX_NS}/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
         attach_yaw_only=True,
@@ -119,6 +164,25 @@ class MySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
+
+    # RayCaster only accepts one mesh prim path, so a custom env's own geometry needs a
+    # second sensor rather than being added to height_scanner above — merged back together
+    # in height_scan_merged(). Points at "..._scan", a single combined Mesh prim that
+    # setup_custom_env() builds from every Mesh under the custom env (RayCaster itself only
+    # reads the first Mesh prim it finds, which misses multi-mesh scenes like ramps/steps
+    # authored as separate cubes). None (disabled) unless a custom env is actually loaded.
+    if args_cli.terrain == "flat" and os.path.isfile(f"./envs/{args_cli.custom_env}.usd"):
+        height_scanner_env = RayCasterCfg(
+            class_type=RayCasterSafeVis,
+            prim_path="{ENV_REGEX_NS}/Robot/base",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            attach_yaw_only=True,
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+            debug_vis=False,
+            mesh_prim_paths=[f"/World/{args_cli.custom_env}_scan"],
+        )
+    else:
+        height_scanner_env = None
 
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
     
@@ -324,7 +388,22 @@ class UnitreeGo2CustomEnvCfg(LocomotionVelocityRoughEnvCfg):
         super().__post_init__()
 
         self.scene.robot = UNITREE_GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.scene.robot.init_state.pos = (0, 0, 0.4)
+        # -90 deg yaw: positive yaw is counter-clockwise from above, so a "turn right" is negative.
+        # self.scene.robot.init_state.rot = (math.cos(math.radians(-45)), 0.0, 0.0, math.sin(math.radians(-45)))
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base"
+
+        if self.scene.height_scanner_env is not None:
+            self.scene.height_scanner_env.prim_path = "{ENV_REGEX_NS}/Robot/base"
+            self.scene.height_scanner_env.update_period = self.decimation * self.sim.dt
+            self.observations.policy.height_scan = ObsTerm(
+                func=height_scan_merged,
+                params={
+                    "sensor_cfg": SceneEntityCfg("height_scanner"),
+                    "sensor_cfg_2": SceneEntityCfg("height_scanner_env"),
+                },
+                clip=(-1.0, 1.0),
+            )
 
         # reduce action scale
         self.actions.joint_pos.scale = 0.25

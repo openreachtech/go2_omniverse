@@ -8,7 +8,7 @@ set -euo pipefail
 # ROS 2 bridge extension ships an internal Jazzy (rclpy + msg libs) matching
 # Python 3.11 — this script points the loader at those libraries.
 
-export ISAAC_VENV="${ISAAC_VENV:-$HOME/Sim/isaac-sim-venv}"
+export ISAAC_VENV="${ISAAC_VENV:-$HOME/isaacsim/env_isaaclab}"
 export ISAACLAB_PATH="${ISAACLAB_PATH:-$HOME/Sim/IsaacLab}"
 export OMNI_KIT_ACCEPT_EULA=YES
 
