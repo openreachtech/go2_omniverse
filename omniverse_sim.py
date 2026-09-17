@@ -21,6 +21,12 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--custom_env", type=str, default="office", help="Setup the environment")
 parser.add_argument("--robot", type=str, default="go2", help="Setup the robot")
 parser.add_argument("--terrain", type=str, default="rough", help="Setup the robot")
+parser.add_argument(
+    "--height_scan", type=str, default="mesh", choices=["mesh", "ground"],
+    help="height_scan source when a custom env is loaded: 'mesh' merges in the custom "
+         "env's geometry (see height_scan_merged in custom_rl_env.py), 'ground' always "
+         "reads /World/ground only, ignoring the custom env's mesh.",
+)
 parser.add_argument("--robot_amount", type=int, default=1, help="Setup the robot amount")
 parser.add_argument("--twinbot", action="store_true", default=False,
                     help="Digital-twin mode: drive sim joints from real Go2 via /real_dog/joint_states "
@@ -237,10 +243,12 @@ def setup_custom_env():
         # separate Mesh prims (common in these envs: floor, ramp steps, walls as distinct
         # meshes). So height_scanner_env has nothing to point at that reliably covers the
         # whole scene; build one combined Mesh prim in world space for it to use instead.
+        # Skipped under --height_scan ground: height_scanner_env doesn't exist then (see
+        # custom_rl_env.py), so this mesh would just be dead weight.
         all_points = []
         all_tris = []
         offset = 0
-        for prim in mesh_prims:
+        for prim in (mesh_prims if args_cli.height_scan == "mesh" else []):
             mesh = UsdGeom.Mesh(prim)
             pts = np.asarray(mesh.GetPointsAttr().Get())
             if pts.size == 0:

@@ -170,8 +170,13 @@ class MySceneCfg(InteractiveSceneCfg):
     # in height_scan_merged(). Points at "..._scan", a single combined Mesh prim that
     # setup_custom_env() builds from every Mesh under the custom env (RayCaster itself only
     # reads the first Mesh prim it finds, which misses multi-mesh scenes like ramps/steps
-    # authored as separate cubes). None (disabled) unless a custom env is actually loaded.
-    if args_cli.terrain == "flat" and os.path.isfile(f"./envs/{args_cli.custom_env}.usd"):
+    # authored as separate cubes). None (disabled) unless a custom env is actually loaded
+    # AND --height_scan mesh (the default) — --height_scan ground forces ground-only.
+    if (
+        args_cli.terrain == "flat"
+        and args_cli.height_scan == "mesh"
+        and os.path.isfile(f"./envs/{args_cli.custom_env}.usd")
+    ):
         height_scanner_env = RayCasterCfg(
             class_type=RayCasterSafeVis,
             prim_path="{ENV_REGEX_NS}/Robot/base",
