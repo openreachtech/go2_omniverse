@@ -27,6 +27,11 @@ parser.add_argument(
          "env's geometry (see height_scan_merged in custom_rl_env.py), 'ground' always "
          "reads /World/ground only, ignoring the custom env's mesh.",
 )
+parser.add_argument(
+    "--height_scan_vis", type=str, default="on", choices=["on", "off"],
+    help="Show the height_scan marker grid (the merged/ground result — see height_scan "
+         "above) as red spheres in the viewport. 'off' skips drawing them entirely.",
+)
 parser.add_argument("--robot_amount", type=int, default=1, help="Setup the robot amount")
 parser.add_argument("--twinbot", action="store_true", default=False,
                     help="Digital-twin mode: drive sim joints from real Go2 via /real_dog/joint_states "
@@ -36,6 +41,45 @@ parser.add_argument("--capture", type=int, default=0,
                          "(headless-safe; uses an isaaclab Camera render product, not a window grab).")
 parser.add_argument("--capture_dir", type=str, default="/tmp/twin_hero",
                     help="Directory to write hero PNGs into when --capture > 0.")
+parser.add_argument(
+    "--policy_path", type=str, default=None,
+    help="Path to an exported TorchScript policy (rsl_rl's <run>/exported/policy.pt), "
+         "e.g. from a blind/recurrent policy trained outside this repo. When set, this "
+         "replaces the usual checkpoint-search + MLP-reconstruction path (agent_cfg.py's "
+         "experiment_name/load_run/load_checkpoint) entirely, and observations are built "
+         "directly to match that export instead of this repo's own ObservationsCfg. "
+         "Only tested with --robot_amount 1 (the exported module's GRU hidden state is "
+         "sized for a single environment).",
+)
+parser.add_argument(
+    "--waypoints", type=str, default=None,
+    help="Semicolon-separated x,y pairs in world coordinates to walk through in order, "
+         "e.g. '1,0;2,2;0,3'. Overrides keyboard control every step: base_command is set "
+         "each frame by steering toward the current waypoint (see _update_waypoint_command "
+         "in run_sim()) instead of waiting for WASD input. Robot must be at env_cfg.scene."
+         "robot's ENV_REGEX_NS origin's coordinate frame (env 0's world origin) — with a "
+         "single env this is just plain world x,y.",
+)
+parser.add_argument(
+    "--waypoint_radius", type=float, default=0.3,
+    help="Distance (m) to a waypoint at which it's considered reached and the robot "
+         "advances to the next one.",
+)
+parser.add_argument(
+    "--waypoint_speed", type=float, default=0.8,
+    help="Max forward speed (m/s) commanded while walking toward a waypoint.",
+)
+parser.add_argument(
+    "--waypoint_loop", action="store_true", default=False,
+    help="Cycle back to the first waypoint after reaching the last one, instead of "
+         "stopping there.",
+)
+parser.add_argument(
+    "--waypoint_delay", type=float, default=10.0,
+    help="Seconds to stand still (waypoint markers still draw, command stays zero) after "
+         "entering the main loop before walking toward the first waypoint — gives the "
+         "livestream viewport time to finish loading before the robot starts moving.",
+)
 
 
 # append RSL-RL cli arguments
@@ -457,26 +501,70 @@ def run_sim():
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
     _ckpt("RslRlVecEnvWrapper: wrapped")
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg["experiment_name"])
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-
-    resume_path = get_checkpoint_path(log_root_path, agent_cfg["load_run"], agent_cfg["load_checkpoint"])
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-
-    # Legacy checkpoint — build a matching MLP for inference (see helper above).
     device = str(env.unwrapped.device)
-    actor, _, _ = _load_mlp_policy(
-        resume_path,
-        hidden_dims=agent_cfg["policy"]["actor_hidden_dims"],
-        activation_name=agent_cfg["policy"]["activation"],
-        device=device,
-    )
 
-    def policy(obs_dict):
-        obs_tensor = obs_dict["policy"] if hasattr(obs_dict, "__getitem__") and "policy" in obs_dict else obs_dict
-        return actor(obs_tensor)
+    if args_cli.policy_path:
+        # Exported TorchScript policy (e.g. a blind/recurrent run from a different
+        # training repo) — its own observation layout replaces this repo's ObservationsCfg
+        # entirely, so it's built by hand below instead of reading env.get_observations().
+        _ckpt(f"loading exported policy: {args_cli.policy_path}")
+        policy_module = torch.jit.load(args_cli.policy_path, map_location=device)
+        policy_module.eval()
+        _ckpt("exported policy loaded")
+
+        robot = env.unwrapped.scene["robot"]
+        num_envs = env_cfg.scene.num_envs
+        if num_envs != 1:
+            print(
+                f"[go2_omniverse] WARNING: --policy_path's exported GRU hidden_state is "
+                f"sized for 1 env, got --robot_amount {num_envs}. Only the first env's "
+                f"actions will be sensible."
+            )
+        num_actions = robot.data.default_joint_pos.shape[1]
+        last_action_buf = torch.zeros(num_envs, num_actions, device=device)
+
+        def policy(obs_dict):
+            # Order/scale matches this export's deploy.yaml exactly: base_ang_vel (x0.2),
+            # projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel (x0.05),
+            # last_action. No height_scan — this policy is blind by design.
+            cmd = torch.tensor(
+                [custom_rl_env.base_command[str(i)] for i in range(num_envs)],
+                dtype=torch.float32, device=device,
+            )
+            obs = torch.cat(
+                [
+                    robot.data.root_ang_vel_b * 0.2,
+                    robot.data.projected_gravity_b,
+                    cmd,
+                    robot.data.joint_pos - robot.data.default_joint_pos,
+                    (robot.data.joint_vel - robot.data.default_joint_vel) * 0.05,
+                    last_action_buf,
+                ],
+                dim=-1,
+            ).clamp(-100.0, 100.0)
+            action = policy_module(obs)
+            last_action_buf.copy_(action)
+            return action
+    else:
+        # specify directory for logging experiments
+        log_root_path = os.path.join("logs", "rsl_rl", agent_cfg["experiment_name"])
+        log_root_path = os.path.abspath(log_root_path)
+        print(f"[INFO] Loading experiment from directory: {log_root_path}")
+
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg["load_run"], agent_cfg["load_checkpoint"])
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+        # Legacy checkpoint — build a matching MLP for inference (see helper above).
+        actor, _, _ = _load_mlp_policy(
+            resume_path,
+            hidden_dims=agent_cfg["policy"]["actor_hidden_dims"],
+            activation_name=agent_cfg["policy"]["activation"],
+            device=device,
+        )
+
+        def policy(obs_dict):
+            obs_tensor = obs_dict["policy"] if hasattr(obs_dict, "__getitem__") and "policy" in obs_dict else obs_dict
+            return actor(obs_tensor)
 
     # reset environment
     _ckpt("env.get_observations()")
@@ -511,10 +599,11 @@ def run_sim():
 
     # Both height_scanner and height_scanner_env have debug_vis off (see custom_rl_env.py) —
     # draw the merged result ourselves instead of two independently-drawn, overlapping grids.
+    # --height_scan_vis off skips this whole block, so no markers ever get created/drawn.
     height_vis = None
     height_scanner_sensor = env.unwrapped.scene.sensors.get("height_scanner")
     height_scanner_env_sensor = env.unwrapped.scene.sensors.get("height_scanner_env")
-    if height_scanner_sensor is not None:
+    if args_cli.height_scan_vis == "on" and height_scanner_sensor is not None:
         from isaaclab.markers import VisualizationMarkers
         from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
 
@@ -534,6 +623,87 @@ def run_sim():
         if points.numel() > 0:
             height_vis.visualize(points)
 
+    # --waypoints overrides keyboard control every step: base_command is recomputed each
+    # frame from the robot's actual world pose (simple proportional heading/speed
+    # controller — not a path planner, just enough to walk through a fixed list of
+    # points instead of driving WASD by hand).
+    update_waypoint_command = None
+    if args_cli.waypoints:
+        waypoints = [tuple(map(float, pair.split(","))) for pair in args_cli.waypoints.split(";")]
+        print(f"[go2_omniverse] waypoints: {waypoints}")
+        waypoint_robot = env.unwrapped.scene["robot"]
+        num_wp_envs = env_cfg.scene.num_envs
+        waypoints_t = torch.tensor(waypoints, dtype=torch.float32, device=device)
+        waypoint_idx = torch.zeros(num_wp_envs, dtype=torch.long, device=device)
+        last_wp = len(waypoints) - 1
+
+        # Static markers at each waypoint (z fixed just above ground level — good enough
+        # for the flat custom envs this is used with): grey = already passed, green =
+        # current target, blue = still ahead. Re-drawn every step so the colors track
+        # waypoint_idx as env 0 (the only one considered here) advances.
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        waypoint_vis = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/Waypoints",
+                markers={
+                    "pending": sim_utils.SphereCfg(
+                        radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.4, 1.0))
+                    ),
+                    "current": sim_utils.SphereCfg(
+                        radius=0.12, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1))
+                    ),
+                    "done": sim_utils.SphereCfg(
+                        radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5))
+                    ),
+                },
+            )
+        )
+        waypoint_translations = torch.cat(
+            [waypoints_t, torch.full((len(waypoints), 1), 0.05, device=device)], dim=-1
+        )
+
+        def draw_waypoints():
+            idx = int(waypoint_idx[0].item())
+            marker_indices = [2 if i < idx else 1 if i == idx else 0 for i in range(len(waypoints))]
+            waypoint_vis.visualize(waypoint_translations, marker_indices=torch.tensor(marker_indices, device=device))
+
+        def update_waypoint_command():
+            draw_waypoints()
+            if time.time() - start_time < args_cli.waypoint_delay:
+                for i in range(num_wp_envs):
+                    custom_rl_env.base_command[str(i)] = [0.0, 0.0, 0.0]
+                return
+            pos = waypoint_robot.data.root_pos_w[:, :2]
+            heading = waypoint_robot.data.heading_w
+            target = waypoints_t[waypoint_idx]
+            delta = target - pos
+            dist = torch.linalg.norm(delta, dim=-1)
+            desired_heading = torch.atan2(delta[:, 1], delta[:, 0])
+            heading_error = torch.atan2(
+                torch.sin(desired_heading - heading), torch.cos(desired_heading - heading)
+            )
+
+            arrived = dist < args_cli.waypoint_radius
+            finished = arrived & (waypoint_idx == last_wp) if not args_cli.waypoint_loop else torch.zeros_like(arrived)
+            if args_cli.waypoint_loop:
+                waypoint_idx[arrived] = (waypoint_idx[arrived] + 1) % len(waypoints)
+            else:
+                waypoint_idx[arrived] = torch.clamp(waypoint_idx[arrived] + 1, max=last_wp)
+
+            # slow down inside the arrival radius instead of overshooting at full speed
+            speed_cap = torch.clamp(
+                dist / max(args_cli.waypoint_radius, 1e-3) * args_cli.waypoint_speed,
+                max=args_cli.waypoint_speed,
+            )
+            lin_vel_x = speed_cap * torch.clamp(torch.cos(heading_error), min=0.0)
+            ang_vel_z = torch.clamp(heading_error * 2.0, -1.2, 1.2)
+            lin_vel_x = torch.where(finished, torch.zeros_like(lin_vel_x), lin_vel_x)
+            ang_vel_z = torch.where(finished, torch.zeros_like(ang_vel_z), ang_vel_z)
+
+            for i in range(num_wp_envs):
+                custom_rl_env.base_command[str(i)] = [lin_vel_x[i].item(), 0.0, ang_vel_z[i].item()]
+
     if args_cli.capture > 0:
         capture_hero_shots(env, policy, obs, device, args_cli.capture, args_cli.capture_dir)
         env.close()
@@ -544,6 +714,8 @@ def run_sim():
     # simulate environment
     while simulation_app.is_running():
         with torch.inference_mode():
+            if update_waypoint_command is not None:
+                update_waypoint_command()
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
             if height_vis is not None:
