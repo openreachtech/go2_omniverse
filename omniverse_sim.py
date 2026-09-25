@@ -52,6 +52,22 @@ parser.add_argument(
          "sized for a single environment).",
 )
 parser.add_argument(
+    "--zero_actions", action="store_true", default=False,
+    help="Skip policy loading entirely and command all-zero actions every step, so the "
+         "robot's own ArticulationCfg PD gains are what (if anything) holds its pose. "
+         "For bringing up a new robot (e.g. --robot anaguma) before a walking policy "
+         "exists: confirms the USD/collision/actuator setup alone, independent of any "
+         "policy. Takes priority over --policy_path if both are set.",
+)
+parser.add_argument(
+    "--lidar_map", action="store_true", default=False,
+    help="Mount a simulated Livox Mid-360 (sensors/rolling_livox_sensor.py) and build the "
+         "609-cell motion-compensated elevation map it feeds (sensors/lidar_elevation_map.py), "
+         "concatenated onto --policy_path's 45-dim proprioceptive observation. For exported "
+         "policies trained with a height_map exteroceptive group (e.g. go2_height_map / "
+         "Go2-Perceptive-Mid360-Phase5-C) — ignored without --policy_path.",
+)
+parser.add_argument(
     "--waypoints", type=str, default=None,
     help="Semicolon-separated x,y pairs in world coordinates to walk through in order, "
          "e.g. '1,0;2,2;0,3'. Overrides keyboard control every step: base_command is set "
@@ -180,7 +196,7 @@ from geometry_msgs.msg import Twist
 _ckpt("import agent_cfg")
 from agent_cfg import unitree_go2_agent_cfg, unitree_g1_agent_cfg
 _ckpt("import custom_rl_env (this pulls isaaclab_assets Unitree USD cfg)")
-from custom_rl_env import UnitreeGo2CustomEnvCfg, G1RoughEnvCfg
+from custom_rl_env import UnitreeGo2CustomEnvCfg, G1RoughEnvCfg, AnagumaCustomEnvCfg
 import custom_rl_env
 _ckpt("import omnigraph")
 from omnigraph import create_front_cam_omnigraph
@@ -478,6 +494,8 @@ def run_sim():
 
     if args_cli.robot == "g1":
         env_cfg = G1RoughEnvCfg()
+    elif args_cli.robot == "anaguma":
+        env_cfg = AnagumaCustomEnvCfg()
 
     # add N robots to env
     env_cfg.scene.num_envs = args_cli.robot_amount
@@ -503,7 +521,14 @@ def run_sim():
     _ckpt("RslRlVecEnvWrapper: wrapped")
     device = str(env.unwrapped.device)
 
-    if args_cli.policy_path:
+    if args_cli.zero_actions:
+        _ckpt("--zero_actions: no policy loaded, commanding all-zero actions")
+        num_actions = env.unwrapped.scene["robot"].data.default_joint_pos.shape[1]
+
+        def policy(obs_dict):
+            return torch.zeros(env_cfg.scene.num_envs, num_actions, device=device)
+
+    elif args_cli.policy_path:
         # Exported TorchScript policy (e.g. a blind/recurrent run from a different
         # training repo) — its own observation layout replaces this repo's ObservationsCfg
         # entirely, so it's built by hand below instead of reading env.get_observations().
@@ -523,15 +548,47 @@ def run_sim():
         num_actions = robot.data.default_joint_pos.shape[1]
         last_action_buf = torch.zeros(num_envs, num_actions, device=device)
 
+        lidar_map = None
+        if args_cli.lidar_map:
+            # Ported from unitree_rl_lab's velocity_env_cfg_mid360.py (_mid360_map_term) —
+            # exact params that run's go2_height_map policy was trained with, except
+            # noise=None: that cfg's LidarNoiseCfg is training-time domain randomization,
+            # and this is a clean inference run.
+            from isaaclab.managers import ObservationTermCfg, SceneEntityCfg
+            from sensors.lidar_elevation_map import LidarElevationMap
+
+            lidar_sensor_cfg = SceneEntityCfg("mid360_scanner")
+            lidar_asset_cfg = SceneEntityCfg("robot")
+            lidar_kwargs = {
+                "offset": 0.273175,
+                "resolution": 0.05,
+                "size": (1.4, 1.0),
+                "scanner_offset_xy": (0.0, 0.0),
+                "exclude_half_extent_x": -1.0,
+                "exclude_half_extent_y": -1.0,
+                "lidar_offset": (0.28945, 0.0, -0.046825),
+                "horizontal_fov": (-180.0, 180.0),
+                "flat_fill": 0.046825,
+                "noise": None,
+                "min_range": 0.2,
+            }
+            lidar_term_cfg = ObservationTermCfg(
+                func=LidarElevationMap,
+                params={"sensor_cfg": lidar_sensor_cfg, "asset_cfg": lidar_asset_cfg, **lidar_kwargs},
+                clip=(-1.0, 5.0),
+            )
+            lidar_map = LidarElevationMap(lidar_term_cfg, env.unwrapped)
+            _ckpt("mid360 elevation map initialized")
+
         def policy(obs_dict):
             # Order/scale matches this export's deploy.yaml exactly: base_ang_vel (x0.2),
             # projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel (x0.05),
-            # last_action. No height_scan — this policy is blind by design.
+            # last_action, [height_map if --lidar_map].
             cmd = torch.tensor(
                 [custom_rl_env.base_command[str(i)] for i in range(num_envs)],
                 dtype=torch.float32, device=device,
             )
-            obs = torch.cat(
+            proprio = torch.cat(
                 [
                     robot.data.root_ang_vel_b * 0.2,
                     robot.data.projected_gravity_b,
@@ -542,6 +599,13 @@ def run_sim():
                 ],
                 dim=-1,
             ).clamp(-100.0, 100.0)
+            if lidar_map is not None:
+                height_map = lidar_map(
+                    env.unwrapped, sensor_cfg=lidar_sensor_cfg, asset_cfg=lidar_asset_cfg, **lidar_kwargs
+                ).clamp(-1.0, 5.0)
+                obs = torch.cat([proprio, height_map], dim=-1)
+            else:
+                obs = proprio
             action = policy_module(obs)
             last_action_buf.copy_(action)
             return action

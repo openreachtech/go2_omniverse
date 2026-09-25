@@ -37,6 +37,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCaster, RayCasterCfg, patterns
+
+from sensors import LivoxPatternCfg, RollingLivoxSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab_assets import UNITREE_GO2_CFG
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -50,6 +52,7 @@ import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 from terrain_cfg import ROUGH_TERRAINS_CFG
 from robots.g1.config import G1_CFG
+from robots.anaguma.config import ANAGUMA_CFG
 
 from omniverse_sim import args_cli
 
@@ -122,6 +125,54 @@ def height_scan_merged(
     return torch.min(dist, dist_2) - offset
 
 
+def _build_mid360_scanner_cfg() -> RollingLivoxSensorCfg | None:
+    """RollingLivoxSensorCfg for --lidar_map, or None when the flag is off.
+
+    A module-level function rather than inline in MySceneCfg's class body: any name
+    assigned directly in an @configclass body becomes a dataclass field, and
+    InteractiveScene misreads a plain str/float local (not a SceneEntityCfg-like object)
+    as a scene entity to instantiate and raises ValueError — the same trap
+    _HEIGHT_SCAN_MESH_PATHS hit earlier in this file's history.
+
+    Mount: the real L1 (utlidar) pose from go2_description.urdf's radar_joint,
+    xyz="0.28945 0 -0.046825" rpy="0 2.8782 0" -- nose tip, pitched 164.9 deg so the
+    sensor hangs nearly upside down looking out and down through the nose aperture.
+    Ported from unitree_rl_lab's velocity_env_cfg_mid360.py (GO2_L1_MOUNT / GO2_L1_ROT),
+    which derives the same values from that URDF. mesh_prim_paths targets the same single
+    mesh as height_scanner/height_scanner_env (RayCaster only accepts one), so all three
+    agree on what "the ground" is in a custom env.
+    """
+    if not args_cli.lidar_map:
+        return None
+    mesh_target = (
+        f"/World/{args_cli.custom_env}_scan"
+        if (
+            args_cli.terrain == "flat"
+            and args_cli.height_scan == "mesh"
+            and os.path.isfile(f"./envs/{args_cli.custom_env}.usd")
+        )
+        else "/World/ground"
+    )
+    l1_pitch = 2.8782  # rad
+    return RollingLivoxSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=RollingLivoxSensorCfg.OffsetCfg(
+            pos=(0.28945, 0.0, -0.046825),
+            rot=(math.cos(l1_pitch / 2), 0.0, math.sin(l1_pitch / 2), 0.0),
+        ),
+        ray_alignment="base",
+        pattern_cfg=LivoxPatternCfg(sensor_type="mid360", samples=4000, downsample=2),
+        mesh_prim_paths=[mesh_target],
+        max_distance=20.0,
+        min_range=0.2,
+        return_pointcloud=False,
+        pointcloud_in_world_frame=False,
+        enable_sensor_noise=False,
+        update_frequency=50.0,
+        debug_vis=False,
+    )
+
+
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
@@ -188,6 +239,13 @@ class MySceneCfg(InteractiveSceneCfg):
         )
     else:
         height_scanner_env = None
+
+    # Mounted only under --lidar_map (see sensors/lidar_elevation_map.py and
+    # omniverse_sim.py's --policy_path branch for what reads this). None (disabled)
+    # otherwise: a bare list/str/float assigned directly in this class body would be
+    # misread by InteractiveScene as a scene entity to instantiate (see
+    # _build_mid360_scanner_cfg for why this is a module-level function instead).
+    mid360_scanner = _build_mid360_scanner_cfg()
 
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
     
@@ -410,6 +468,10 @@ class UnitreeGo2CustomEnvCfg(LocomotionVelocityRoughEnvCfg):
                 clip=(-1.0, 1.0),
             )
 
+        if self.scene.mid360_scanner is not None:
+            self.scene.mid360_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base"
+            self.scene.mid360_scanner.update_period = self.decimation * self.sim.dt
+
         # reduce action scale
         self.actions.joint_pos.scale = 0.25
 
@@ -424,6 +486,52 @@ class UnitreeGo2CustomEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # terminations
         self.terminations.base_contact.params["sensor_cfg"].body_names = "base"
+
+
+@configclass
+class AnagumaCustomEnvCfg(LocomotionVelocityRoughEnvCfg):
+    """Tsubame Industries "Anaguma" quadruped (robots/anaguma/) — no walking policy has
+    been trained for this robot yet, so actions.joint_pos.scale below is a placeholder:
+    update it (and check the observation layout above still matches) once a real policy
+    is available, the same way go2_blind_gru_phase4 was wired in via --policy_path.
+    """
+
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        self.scene.robot = ANAGUMA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Anaguma's own root link is named "base_link" (Go2's is "base") — every
+        # body_names reference below has to use that name instead.
+        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+
+        if self.scene.height_scanner_env is not None:
+            self.scene.height_scanner_env.prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+            self.scene.height_scanner_env.update_period = self.decimation * self.sim.dt
+            self.observations.policy.height_scan = ObsTerm(
+                func=height_scan_merged,
+                params={
+                    "sensor_cfg": SceneEntityCfg("height_scanner"),
+                    "sensor_cfg_2": SceneEntityCfg("height_scanner_env"),
+                },
+                clip=(-1.0, 1.0),
+            )
+
+        # PLACEHOLDER — no trained policy yet; update to match whatever policy is plugged
+        # in later (its action scale/offset convention, exactly like unitree_go2's 0.25).
+        self.actions.joint_pos.scale = 1.0
+
+        # rewards
+        self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
+        self.rewards.feet_air_time.weight = 0.01
+        self.rewards.undesired_contacts = None
+        self.rewards.dof_torques_l2.weight = -0.0002
+        self.rewards.track_lin_vel_xy_exp.weight = 1.5
+        self.rewards.track_ang_vel_z_exp.weight = 0.75
+        self.rewards.dof_acc_l2.weight = -2.5e-7
+
+        # terminations
+        self.terminations.base_contact.params["sensor_cfg"].body_names = "base_link"
 
 
 @configclass

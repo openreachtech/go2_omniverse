@@ -26,6 +26,13 @@ export OMNI_KIT_ACCEPT_EULA=YES
 export ROS_DISTRO=humble
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 
+# IsaacLab defaults its log dir to $TMPDIR/isaaclab/logs (tempfile.gettempdir()). On a
+# shared machine /tmp/isaaclab may already exist owned by another user with no
+# write access for us, which crashes gym.make() with a PermissionError before the
+# sim even starts. Point TMPDIR at a directory only this user can touch instead.
+export TMPDIR="${TMPDIR:-$HOME/.cache/isaac_tmp}"
+mkdir -p "$TMPDIR"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$ISAAC_VENV/bin/activate"
