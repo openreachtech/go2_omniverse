@@ -96,6 +96,37 @@ parser.add_argument(
          "entering the main loop before walking toward the first waypoint — gives the "
          "livestream viewport time to finish loading before the robot starts moving.",
 )
+parser.add_argument(
+    "--record_video", type=str, default=None,
+    help="Path to write an MP4 recording to (e.g. /tmp/run.mp4), via a dedicated world-space "
+         "Camera piped to ffmpeg — sharper than screen-recording the (compressed) livestream. "
+         "The camera chases env 0's robot at a fixed offset that tracks position and yaw only "
+         "(never roll/pitch, so the shot doesn't tilt with the body). Requires 'ffmpeg' on PATH.",
+)
+parser.add_argument(
+    "--record_res_w", type=int, default=1280, help="Recording frame width (px).",
+)
+parser.add_argument(
+    "--record_res_h", type=int, default=720, help="Recording frame height (px).",
+)
+parser.add_argument(
+    "--record_fps", type=float, default=30.0,
+    help="Recording frame rate. Frames are captured every Nth sim step so playback speed "
+         "matches wall-clock sim time (N = round((1/step_dt) / record_fps)).",
+)
+parser.add_argument(
+    "--record_distance", type=float, default=1.2,
+    help="Horizontal distance (m) the camera trails behind the robot, in its yaw-facing frame.",
+)
+parser.add_argument(
+    "--record_cam_height", type=float, default=1.0,
+    help="Extra height (m) of the camera above the robot's own root height.",
+)
+parser.add_argument(
+    "--record_focal_length", type=float, default=12.0,
+    help="Lens focal length (mm) against a fixed 20.955mm aperture — smaller is wider. "
+         "24mm is roughly the onboard front_cam's FOV; 12mm is noticeably wider.",
+)
 
 
 # append RSL-RL cli arguments
@@ -548,6 +579,15 @@ def run_sim():
         num_actions = robot.data.default_joint_pos.shape[1]
         last_action_buf = torch.zeros(num_envs, num_actions, device=device)
 
+        # Go2's native USD joint order already matches its exported policies' training
+        # order, so no reordering is needed there. Anaguma's training order (BL,BR,FL,FR —
+        # see ANAGUMA_POLICY_JOINT_ORDER) differs from this repo's USD's native order, so
+        # joint_pos_rel/joint_vel_rel below must be gathered into that order explicitly.
+        obs_joint_idx = None
+        if args_cli.robot == "anaguma":
+            obs_joint_idx, _ = robot.find_joints(custom_rl_env.ANAGUMA_POLICY_JOINT_ORDER, preserve_order=True)
+            obs_joint_idx = torch.tensor(obs_joint_idx, device=device)
+
         lidar_map = None
         if args_cli.lidar_map:
             # Ported from unitree_rl_lab's velocity_env_cfg_mid360.py (_mid360_map_term) —
@@ -559,19 +599,37 @@ def run_sim():
 
             lidar_sensor_cfg = SceneEntityCfg("mid360_scanner")
             lidar_asset_cfg = SceneEntityCfg("robot")
-            lidar_kwargs = {
-                "offset": 0.273175,
-                "resolution": 0.05,
-                "size": (1.4, 1.0),
-                "scanner_offset_xy": (0.0, 0.0),
-                "exclude_half_extent_x": -1.0,
-                "exclude_half_extent_y": -1.0,
-                "lidar_offset": (0.28945, 0.0, -0.046825),
-                "horizontal_fov": (-180.0, 180.0),
-                "flat_fill": 0.046825,
-                "noise": None,
-                "min_range": 0.2,
-            }
+            if args_cli.robot == "anaguma":
+                # Ported from robots/anaguma/anaguma_mid360.py's ANAGUMA_* constants —
+                # exact params anaguma_perceptive_mid360_phase2 was trained with (noise=None
+                # for the same clean-inference reason as Go2's below).
+                lidar_kwargs = {
+                    "offset": 0.35,
+                    "resolution": 0.05,
+                    "size": (1.6, 1.0),
+                    "scanner_offset_xy": (0.0, 0.0),
+                    "exclude_half_extent_x": -1.0,
+                    "exclude_half_extent_y": -1.0,
+                    "lidar_offset": (0.26, 0.0, -0.10),
+                    "horizontal_fov": (-180.0, 180.0),
+                    "flat_fill": 0.10,
+                    "noise": None,
+                    "min_range": 0.2,
+                }
+            else:
+                lidar_kwargs = {
+                    "offset": 0.273175,
+                    "resolution": 0.05,
+                    "size": (1.4, 1.0),
+                    "scanner_offset_xy": (0.0, 0.0),
+                    "exclude_half_extent_x": -1.0,
+                    "exclude_half_extent_y": -1.0,
+                    "lidar_offset": (0.28945, 0.0, -0.046825),
+                    "horizontal_fov": (-180.0, 180.0),
+                    "flat_fill": 0.046825,
+                    "noise": None,
+                    "min_range": 0.2,
+                }
             lidar_term_cfg = ObservationTermCfg(
                 func=LidarElevationMap,
                 params={"sensor_cfg": lidar_sensor_cfg, "asset_cfg": lidar_asset_cfg, **lidar_kwargs},
@@ -588,13 +646,22 @@ def run_sim():
                 [custom_rl_env.base_command[str(i)] for i in range(num_envs)],
                 dtype=torch.float32, device=device,
             )
+            joint_pos = robot.data.joint_pos
+            joint_vel = robot.data.joint_vel
+            default_joint_pos = robot.data.default_joint_pos
+            default_joint_vel = robot.data.default_joint_vel
+            if obs_joint_idx is not None:
+                joint_pos = joint_pos[:, obs_joint_idx]
+                joint_vel = joint_vel[:, obs_joint_idx]
+                default_joint_pos = default_joint_pos[:, obs_joint_idx]
+                default_joint_vel = default_joint_vel[:, obs_joint_idx]
             proprio = torch.cat(
                 [
                     robot.data.root_ang_vel_b * 0.2,
                     robot.data.projected_gravity_b,
                     cmd,
-                    robot.data.joint_pos - robot.data.default_joint_pos,
-                    (robot.data.joint_vel - robot.data.default_joint_vel) * 0.05,
+                    joint_pos - default_joint_pos,
+                    (joint_vel - default_joint_vel) * 0.05,
                     last_action_buf,
                 ],
                 dim=-1,
@@ -732,8 +799,16 @@ def run_sim():
             marker_indices = [2 if i < idx else 1 if i == idx else 0 for i in range(len(waypoints))]
             waypoint_vis.visualize(waypoint_translations, marker_indices=torch.tensor(marker_indices, device=device))
 
+        last_xy_print = 0.0
+
         def update_waypoint_command():
+            nonlocal last_xy_print
             draw_waypoints()
+            now = time.time()
+            if now - last_xy_print >= 5.0:
+                last_xy_print = now
+                xy = waypoint_robot.data.root_pos_w[0, :2].tolist()
+                print(f"[go2_omniverse] xy = ({xy[0]:.2f}, {xy[1]:.2f})")
             if time.time() - start_time < args_cli.waypoint_delay:
                 for i in range(num_wp_envs):
                     custom_rl_env.base_command[str(i)] = [0.0, 0.0, 0.0]
@@ -774,6 +849,108 @@ def run_sim():
         simulation_app.close()
         return
 
+    # Dedicated world-space chase camera piped to ffmpeg, sharper than screen-recording
+    # the (compressed) livestream. Set up after the --capture branch above so a --capture
+    # run never launches an ffmpeg process it will never feed.
+    record_state = None
+    if args_cli.record_video and not args_cli.enable_cameras:
+        print(
+            "[go2_omniverse] --record_video needs --enable_cameras too (rendering is off "
+            "otherwise, regardless of --livestream) — recording disabled for this run."
+        )
+    elif args_cli.record_video:
+        import atexit
+        import subprocess
+        import numpy as np
+        from isaaclab.sensors import Camera, CameraCfg
+
+        record_cam = Camera(CameraCfg(
+            prim_path="/World/record_cam",
+            height=args_cli.record_res_h, width=args_cli.record_res_w,
+            update_period=0.0, data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=args_cli.record_focal_length, focus_distance=400.0,
+                horizontal_aperture=20.955, clipping_range=(0.05, 1.0e6),
+            ),
+        ))
+        record_dt = float(getattr(env.unwrapped, "step_dt", 1.0 / 60.0))
+        record_stride = max(round((1.0 / record_dt) / args_cli.record_fps), 1)
+
+        ffmpeg_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{args_cli.record_res_w}x{args_cli.record_res_h}",
+                "-r", str(args_cli.record_fps),
+                "-i", "-",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                args_cli.record_video,
+            ],
+            stdin=subprocess.PIPE,
+        )
+        record_state = {"step": 0, "cam_ready": False, "warmup": 5}
+        print(
+            f"[go2_omniverse] recording to {args_cli.record_video} "
+            f"({args_cli.record_res_w}x{args_cli.record_res_h} @ {args_cli.record_fps}fps, "
+            f"every {record_stride} sim steps)"
+        )
+
+        def finalize_recording():
+            # mp4's index (the "moov atom") is only written when ffmpeg exits cleanly, so
+            # an interrupted run (Ctrl+C, an exception) with no finalize step produces an
+            # unplayable file. atexit still fires on those (unlike a hard SIGKILL/timeout
+            # -t kill, which this can't help), so register it instead of only closing
+            # stdin after the main loop's normal exit.
+            if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
+                ffmpeg_proc.stdin.close()
+            ffmpeg_proc.wait()
+
+        atexit.register(finalize_recording)
+
+        def update_recording():
+            record_state["step"] += 1
+            if record_state["step"] % record_stride != 0:
+                return
+            robot = env.unwrapped.scene["robot"]
+            pos = robot.data.root_pos_w[:1]
+            yaw = robot.data.heading_w[:1]
+            # Yaw-only chase offset: rotating a fixed "behind" vector by yaw alone (never
+            # the body's full orientation) is what keeps the shot level through roll/pitch.
+            cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+            behind = torch.stack(
+                [-cos_y * args_cli.record_distance, -sin_y * args_cli.record_distance,
+                 torch.full_like(yaw, args_cli.record_cam_height)],
+                dim=-1,
+            )
+
+            # Camera created after sim play never gets its PHYSICS_READY init callback
+            # (see capture_hero_shots) — force it once. set_world_poses_from_view() needs
+            # self._ALL_INDICES, which _initialize_impl() is what creates, so pose-setting
+            # has to come after init, not before.
+            if not record_state["cam_ready"]:
+                if not record_cam.is_initialized:
+                    record_cam._initialize_impl()
+                    record_cam._is_initialized = True
+                record_state["cam_ready"] = True
+            record_cam.set_world_poses_from_view(pos + behind, pos.clone())
+            record_cam.update(record_dt * record_stride)
+
+            # capture_hero_shots' first .data.output read only ever happens after 24+
+            # real env.step()-interleaved update() calls — several update()s in a row
+            # with no env.step() between them (tried first) still crashed the first read
+            # with an empty-index broadcast error, so the render pipeline apparently needs
+            # actual sim ticks between camera updates, not just repeated update() calls.
+            # Skip reading/encoding the first few stride-selected frames instead, which
+            # get exactly that (each one IS a separate env.step() elsewhere in the loop).
+            if record_state["warmup"] > 0:
+                record_state["warmup"] -= 1
+                return
+
+            rgb = record_cam.data.output["rgb"][0].detach().cpu().numpy()
+            if rgb.dtype != np.uint8:
+                rgb = np.clip(rgb * (255.0 if rgb.max() <= 1.0 else 1.0), 0, 255).astype(np.uint8)
+            ffmpeg_proc.stdin.write(np.ascontiguousarray(rgb[..., :3]).tobytes())
+
     start_time = time.time()
     # simulate environment
     while simulation_app.is_running():
@@ -784,9 +961,14 @@ def run_sim():
             obs, _, _, _ = env.step(actions)
             if height_vis is not None:
                 _draw_merged_height_scan()
+            if record_state is not None:
+                update_recording()
             if twin is not None:
                 # Overwrite physics-stepped state with the real dog's state.
                 # Kinematic playback — bypasses PD/gravity for an exact mirror.
                 twin.apply(device)
             pub_robo_data_ros2(args_cli.robot, env_cfg.scene.num_envs, base_node, env, annotator_lst, start_time)
+    if record_state is not None:
+        finalize_recording()
+        print(f"[go2_omniverse] recording finalized: {args_cli.record_video}")
     env.close()

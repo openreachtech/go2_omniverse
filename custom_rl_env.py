@@ -488,12 +488,26 @@ class UnitreeGo2CustomEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.terminations.base_contact.params["sensor_cfg"].body_names = "base"
 
 
+ANAGUMA_POLICY_JOINT_ORDER = [
+    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+]
+"""Joint order anaguma_perceptive_mid360_phase2 was trained with (its own deploy.yaml:
+BL,BR,FL,FR x hip,thigh,knee), translated to this repo's naming: tsubame_isaac_env calls
+the rear legs BL/BR ("back"), this repo's URDF calls them RL/RR ("rear"); tsubame_isaac_env
+calls the shank joint "knee", this repo's URDF (and Go2's) calls it "calf". Used both for
+AnagumaCustomEnvCfg's action joint order below and for the --lidar_map proprioceptive
+observation order in omniverse_sim.py's --policy_path branch — see
+_build_mid360_scanner_cfg's docstring for why this lives at module level."""
+
+
 @configclass
 class AnagumaCustomEnvCfg(LocomotionVelocityRoughEnvCfg):
-    """Tsubame Industries "Anaguma" quadruped (robots/anaguma/) — no walking policy has
-    been trained for this robot yet, so actions.joint_pos.scale below is a placeholder:
-    update it (and check the observation layout above still matches) once a real policy
-    is available, the same way go2_blind_gru_phase4 was wired in via --policy_path.
+    """Tsubame Industries "Anaguma" quadruped (robots/anaguma/). Wired for
+    anaguma_perceptive_mid360_phase2 via --policy_path --lidar_map --robot anaguma, the
+    same way go2_blind_gru_phase4 / go2_height_map are for Go2.
     """
 
     def __post_init__(self):
@@ -517,9 +531,21 @@ class AnagumaCustomEnvCfg(LocomotionVelocityRoughEnvCfg):
                 clip=(-1.0, 1.0),
             )
 
-        # PLACEHOLDER — no trained policy yet; update to match whatever policy is plugged
-        # in later (its action scale/offset convention, exactly like unitree_go2's 0.25).
-        self.actions.joint_pos.scale = 1.0
+        if self.scene.mid360_scanner is not None:
+            # Front-of-chest mount (no nose to put it in, unlike Go2) — see
+            # robots/anaguma/anaguma_mid360.py's ANAGUMA_LIDAR_OFFSET_* for the derivation.
+            # Pitch (offset.rot) is unchanged: same mount orientation as Go2's L1.
+            self.scene.mid360_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+            self.scene.mid360_scanner.offset.pos = (0.26, 0.0, -0.10)
+            self.scene.mid360_scanner.update_period = self.decimation * self.sim.dt
+
+        # Matches anaguma_perceptive_mid360_phase2's deploy.yaml exactly: scale 0.25,
+        # and an explicit joint order (preserve_order=True) so the action vector
+        # --policy_path's exported policy outputs — BL,BR,FL,FR x hip,thigh,knee, see
+        # ANAGUMA_POLICY_JOINT_ORDER — lands on the right joint without any reordering.
+        self.actions.joint_pos.scale = 0.25
+        self.actions.joint_pos.joint_names = ANAGUMA_POLICY_JOINT_ORDER
+        self.actions.joint_pos.preserve_order = True
 
         # rewards
         self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
