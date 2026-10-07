@@ -53,6 +53,7 @@ import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from terrain_cfg import ROUGH_TERRAINS_CFG
 from robots.g1.config import G1_CFG
 from robots.anaguma.config import ANAGUMA_CFG
+from robots.a2.config import A2_CFG
 
 from omniverse_sim import args_cli
 
@@ -125,6 +126,45 @@ def height_scan_merged(
     return torch.min(dist, dist_2) - offset
 
 
+def _scan_mesh_target() -> str:
+    """The single mesh prim every RayCaster-based sensor in this file points at.
+
+    Shared by height_scanner_env, mid360_scanner and (for --robot a2) lidar_front/rear,
+    so all of them agree on what "the ground" is in a custom env — see
+    _build_mid360_scanner_cfg's docstring for why a custom env's geometry has to be
+    merged into one Mesh prim in the first place.
+    """
+    return (
+        f"/World/{args_cli.custom_env}_scan"
+        if (
+            args_cli.terrain == "flat"
+            and args_cli.height_scan == "mesh"
+            and os.path.isfile(f"./envs/{args_cli.custom_env}.usd")
+        )
+        else "/World/ground"
+    )
+
+
+def _build_a2_lidar_cfgs() -> tuple[RayCasterCfg, RayCasterCfg] | tuple[None, None]:
+    """(lidar_front, lidar_rear) RayCasterCfg for --lidar_map --robot a2, else (None, None).
+
+    See sensors/a2_lidar_accum.py for the mount geometry and the world-fixed
+    accumulation map these feed (tb01_a2_distill_distill2_20500's training layout, ported
+    from robots/a2/tmp/a2_share/code/a2_package/lidar_accum.py). A module-level function
+    for the same @configclass-field-misinterpretation reason as _build_mid360_scanner_cfg.
+    """
+    if not (args_cli.lidar_map and args_cli.robot == "a2"):
+        return None, None
+    from sensors.a2_lidar_accum import lidar_cfg
+
+    mesh_target = _scan_mesh_target()
+    prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+    return (
+        lidar_cfg("front", prim_path=prim_path, mesh_prim_paths=[mesh_target]),
+        lidar_cfg("rear", prim_path=prim_path, mesh_prim_paths=[mesh_target]),
+    )
+
+
 def _build_mid360_scanner_cfg() -> RollingLivoxSensorCfg | None:
     """RollingLivoxSensorCfg for --lidar_map, or None when the flag is off.
 
@@ -140,19 +180,12 @@ def _build_mid360_scanner_cfg() -> RollingLivoxSensorCfg | None:
     Ported from unitree_rl_lab's velocity_env_cfg_mid360.py (GO2_L1_MOUNT / GO2_L1_ROT),
     which derives the same values from that URDF. mesh_prim_paths targets the same single
     mesh as height_scanner/height_scanner_env (RayCaster only accepts one), so all three
-    agree on what "the ground" is in a custom env.
+    agree on what "the ground" is in a custom env. Not built for --robot a2, which uses
+    its own front/rear lidar pair (_build_a2_lidar_cfgs) instead.
     """
-    if not args_cli.lidar_map:
+    if not (args_cli.lidar_map and args_cli.robot != "a2"):
         return None
-    mesh_target = (
-        f"/World/{args_cli.custom_env}_scan"
-        if (
-            args_cli.terrain == "flat"
-            and args_cli.height_scan == "mesh"
-            and os.path.isfile(f"./envs/{args_cli.custom_env}.usd")
-        )
-        else "/World/ground"
-    )
+    mesh_target = _scan_mesh_target()
     l1_pitch = 2.8782  # rad
     return RollingLivoxSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
@@ -246,6 +279,10 @@ class MySceneCfg(InteractiveSceneCfg):
     # misread by InteractiveScene as a scene entity to instantiate (see
     # _build_mid360_scanner_cfg for why this is a module-level function instead).
     mid360_scanner = _build_mid360_scanner_cfg()
+
+    # --robot a2's own front/rear LiDAR pair (see _build_a2_lidar_cfgs); None/None for
+    # every other robot or without --lidar_map.
+    lidar_front, lidar_rear = _build_a2_lidar_cfgs()
 
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
     
@@ -546,6 +583,63 @@ class AnagumaCustomEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.actions.joint_pos.scale = 0.25
         self.actions.joint_pos.joint_names = ANAGUMA_POLICY_JOINT_ORDER
         self.actions.joint_pos.preserve_order = True
+
+        # rewards
+        self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
+        self.rewards.feet_air_time.weight = 0.01
+        self.rewards.undesired_contacts = None
+        self.rewards.dof_torques_l2.weight = -0.0002
+        self.rewards.track_lin_vel_xy_exp.weight = 1.5
+        self.rewards.track_ang_vel_z_exp.weight = 0.75
+        self.rewards.dof_acc_l2.weight = -2.5e-7
+
+        # terminations
+        self.terminations.base_contact.params["sensor_cfg"].body_names = "base_link"
+
+
+@configclass
+class A2CustomEnvCfg(LocomotionVelocityRoughEnvCfg):
+    """Unitree A2 quadruped (robots/a2/). Wired for tb01_a2_distill_distill2_20500 via
+    --policy_path --lidar_map --robot a2 — see sensors/a2_lidar_accum.py and
+    omniverse_sim.py's --policy_path branch for the rest (its 421-dim observation is a
+    plain-MLP distilled policy, not the GRU architecture Go2/Anaguma's exports use, so
+    it's loaded and driven by different code there).
+
+    Unlike Anaguma, no joint reordering is needed: robots/a2/config.py's docstring
+    records the empirical check (not an assumption) that this repo's a2.usd and
+    unitree_rl_lab's own UNITREE_A2_CFG produce the same joint order from the same
+    a2_description source, so the action/obs joint order here is left at the default
+    (native order, same as Go2).
+    """
+
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        self.scene.robot = A2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # A2's own root link is named "base_link" (Go2's is "base") — every body_names
+        # reference below has to use that name instead.
+        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+
+        if self.scene.height_scanner_env is not None:
+            self.scene.height_scanner_env.prim_path = "{ENV_REGEX_NS}/Robot/base_link"
+            self.scene.height_scanner_env.update_period = self.decimation * self.sim.dt
+            self.observations.policy.height_scan = ObsTerm(
+                func=height_scan_merged,
+                params={
+                    "sensor_cfg": SceneEntityCfg("height_scanner"),
+                    "sensor_cfg_2": SceneEntityCfg("height_scanner_env"),
+                },
+                clip=(-1.0, 1.0),
+            )
+
+        if self.scene.lidar_front is not None:
+            self.scene.lidar_front.update_period = self.decimation * self.sim.dt
+            self.scene.lidar_rear.update_period = self.decimation * self.sim.dt
+
+        # Matches tb01_a2_distill_distill2_20500's training action convention
+        # (robots/a2/tmp/a2_share/code/play_block03_solo.py: "公式は 0.25").
+        self.actions.joint_pos.scale = 0.25
 
         # rewards
         self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"

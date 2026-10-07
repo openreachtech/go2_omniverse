@@ -7,9 +7,10 @@ import argparse
 from isaaclab.app import AppLauncher
 
 
-import cli_args  
+import cli_args
 import time
 import os
+import math
 import threading
 
 
@@ -43,13 +44,15 @@ parser.add_argument("--capture_dir", type=str, default="/tmp/twin_hero",
                     help="Directory to write hero PNGs into when --capture > 0.")
 parser.add_argument(
     "--policy_path", type=str, default=None,
-    help="Path to an exported TorchScript policy (rsl_rl's <run>/exported/policy.pt), "
-         "e.g. from a blind/recurrent policy trained outside this repo. When set, this "
-         "replaces the usual checkpoint-search + MLP-reconstruction path (agent_cfg.py's "
-         "experiment_name/load_run/load_checkpoint) entirely, and observations are built "
-         "directly to match that export instead of this repo's own ObservationsCfg. "
-         "Only tested with --robot_amount 1 (the exported module's GRU hidden state is "
-         "sized for a single environment).",
+    help="Path to an exported policy, e.g. from a policy trained outside this repo. "
+         "Either an exported TorchScript module (rsl_rl's <run>/exported/policy.pt, a "
+         "blind/recurrent GRU policy) or, for --robot a2 only, a raw rsl_rl distillation "
+         "checkpoint (a plain MLP state_dict, no GRU — see _load_distilled_mlp_policy). "
+         "When set, this replaces the usual checkpoint-search + MLP-reconstruction path "
+         "(agent_cfg.py's experiment_name/load_run/load_checkpoint) entirely, and "
+         "observations are built directly to match that export instead of this repo's "
+         "own ObservationsCfg. Only tested with --robot_amount 1 (the GRU hidden state / "
+         "LiDAR accumulation map is sized for a single environment).",
 )
 parser.add_argument(
     "--zero_actions", action="store_true", default=False,
@@ -61,11 +64,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--lidar_map", action="store_true", default=False,
-    help="Mount a simulated Livox Mid-360 (sensors/rolling_livox_sensor.py) and build the "
-         "609-cell motion-compensated elevation map it feeds (sensors/lidar_elevation_map.py), "
-         "concatenated onto --policy_path's 45-dim proprioceptive observation. For exported "
-         "policies trained with a height_map exteroceptive group (e.g. go2_height_map / "
-         "Go2-Perceptive-Mid360-Phase5-C) — ignored without --policy_path.",
+    help="Mount the simulated LiDAR sensor(s) --policy_path's exported policy needs and "
+         "build the exteroceptive map it feeds. For Go2/Anaguma: a Livox Mid-360 "
+         "(sensors/rolling_livox_sensor.py) + 609/693-cell motion-compensated elevation "
+         "map (sensors/lidar_elevation_map.py), concatenated onto the 45-dim proprioceptive "
+         "observation. For --robot a2: a front/rear LiDAR pair + 374-cell world-fixed "
+         "accumulation map (sensors/a2_lidar_accum.py), concatenated onto its 47-dim "
+         "proprioceptive observation. Ignored without --policy_path.",
 )
 parser.add_argument(
     "--waypoints", type=str, default=None,
@@ -227,7 +232,7 @@ from geometry_msgs.msg import Twist
 _ckpt("import agent_cfg")
 from agent_cfg import unitree_go2_agent_cfg, unitree_g1_agent_cfg
 _ckpt("import custom_rl_env (this pulls isaaclab_assets Unitree USD cfg)")
-from custom_rl_env import UnitreeGo2CustomEnvCfg, G1RoughEnvCfg, AnagumaCustomEnvCfg
+from custom_rl_env import UnitreeGo2CustomEnvCfg, G1RoughEnvCfg, AnagumaCustomEnvCfg, A2CustomEnvCfg
 import custom_rl_env
 _ckpt("import omnigraph")
 from omnigraph import create_front_cam_omnigraph
@@ -266,6 +271,58 @@ def _load_mlp_policy(ckpt_path: str, hidden_dims, activation_name: str, device: 
     actor_sd = {k[len("actor."):]: v for k, v in sd.items() if k.startswith("actor.")}
     actor.load_state_dict(actor_sd)
     actor.to(device).eval()
+    return actor, actor_in, actor_out
+
+
+def _load_distilled_mlp_policy(ckpt_path: str, device: str):
+    """Load a raw rsl_rl distillation checkpoint: a plain ELU MLP actor (no GRU), with
+    its hidden widths inferred from the checkpoint's own layer shapes rather than an
+    agent_cfg (unlike _load_mlp_policy above, there's no training-repo agent.yaml to
+    read one from here), plus its empirical observation normalizer if the checkpoint
+    carries one (``actor_obs_normalizer``) — applied as `(obs - mean) / sqrt(var + eps)`
+    before the actor, exactly matching robots/a2/tmp/a2_share/code/play_block03_solo.py's
+    load_actor(), whose own comment notes the policy was trained on normalized
+    observations and is under-evaluated without this.
+    """
+    import torch.nn as nn
+
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = state["model_state_dict"]
+
+    idx = sorted({int(k.split(".")[1]) for k in sd if k.startswith("actor.") and k.endswith(".weight")})
+    layers = []
+    for n, i in enumerate(idx):
+        w, b = sd[f"actor.{i}.weight"], sd[f"actor.{i}.bias"]
+        lin = nn.Linear(w.shape[1], w.shape[0])
+        with torch.no_grad():
+            lin.weight.copy_(w)
+            lin.bias.copy_(b)
+        layers.append(lin)
+        if n < len(idx) - 1:
+            layers.append(nn.ELU())
+    actor = nn.Sequential(*layers).to(device).eval()
+
+    mean = sd.get("actor_obs_normalizer._mean")
+    var = sd.get("actor_obs_normalizer._var")
+    if mean is not None and var is not None:
+        mean = mean.flatten().to(device)
+        var = var.flatten().to(device)
+        inner = actor
+
+        class _Normalized(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = inner
+                self.register_buffer("m", mean)
+                self.register_buffer("v", var)
+
+            def forward(self, x):
+                return self.inner((x - self.m) / torch.sqrt(self.v + 1e-8))
+
+        actor = _Normalized().to(device).eval()
+
+    actor_in = sd[f"actor.{idx[0]}.weight"].shape[1]
+    actor_out = sd[f"actor.{idx[-1]}.weight"].shape[0]
     return actor, actor_in, actor_out
 
 
@@ -527,6 +584,8 @@ def run_sim():
         env_cfg = G1RoughEnvCfg()
     elif args_cli.robot == "anaguma":
         env_cfg = AnagumaCustomEnvCfg()
+    elif args_cli.robot == "a2":
+        env_cfg = A2CustomEnvCfg()
 
     # add N robots to env
     env_cfg.scene.num_envs = args_cli.robot_amount
@@ -558,6 +617,77 @@ def run_sim():
 
         def policy(obs_dict):
             return torch.zeros(env_cfg.scene.num_envs, num_actions, device=device)
+
+    elif args_cli.policy_path and args_cli.robot == "a2":
+        # tb01_a2_distill_distill2_20500 is a raw rsl_rl checkpoint (model_state_dict),
+        # not a TorchScript export — a plain distilled MLP (no GRU) over a 421-dim
+        # observation (47 proprio + 374 world-fixed LiDAR accumulation map), verified
+        # against robots/a2/tmp/a2_share/code/play_block03_solo.py's official_obs() /
+        # LA.lidar_accum_scan(). See robots/a2/config.py and sensors/a2_lidar_accum.py.
+        _ckpt(f"loading distilled A2 policy: {args_cli.policy_path}")
+        actor, actor_in, actor_out = _load_distilled_mlp_policy(args_cli.policy_path, device)
+        _ckpt(f"distilled A2 policy loaded (obs {actor_in} -> action {actor_out})")
+
+        robot = env.unwrapped.scene["robot"]
+        num_envs = env_cfg.scene.num_envs
+        if num_envs != 1:
+            print(
+                f"[go2_omniverse] WARNING: --policy_path --robot a2's LiDAR accumulation "
+                f"map is sized for 1 env, got --robot_amount {num_envs}. Only the first "
+                f"env's actions will be sensible."
+            )
+        num_actions = robot.data.default_joint_pos.shape[1]
+        last_action_buf = torch.zeros(num_envs, num_actions, device=device)
+        t_state = {"t": 0.0}
+        step_dt = float(getattr(env.unwrapped, "step_dt", 1.0 / 50.0))
+
+        lidar_accum = None
+        if args_cli.lidar_map:
+            from sensors.a2_lidar_accum import A2LidarAccumulator
+
+            lidar_accum = A2LidarAccumulator(env.unwrapped, device)
+            _ckpt("A2 LiDAR accumulation map initialized")
+        else:
+            print(
+                "[go2_omniverse] WARNING: this A2 policy was trained with a 374-dim "
+                "LiDAR map (--lidar_map) — without it the 421-dim observation can't be "
+                "built and this will crash on the first policy() call."
+            )
+
+        def policy(obs_dict):
+            robot_data = robot.data
+            cmd = torch.tensor(
+                [custom_rl_env.base_command[str(i)] for i in range(num_envs)],
+                dtype=torch.float32, device=device,
+            )
+            t = t_state["t"]
+            t_state["t"] = t + step_dt
+            phase_period = 0.6
+            ph = (t % phase_period) / phase_period
+            if float(torch.linalg.norm(cmd)) < 0.1:
+                phase = torch.zeros(num_envs, 2, device=device, dtype=torch.float32)
+            else:
+                phase = torch.tensor(
+                    [[math.sin(2.0 * math.pi * ph), math.cos(2.0 * math.pi * ph)]],
+                    device=device, dtype=torch.float32,
+                ).expand(num_envs, -1)
+            proprio = torch.cat(
+                [
+                    robot_data.root_ang_vel_b,
+                    robot_data.projected_gravity_b,
+                    cmd,
+                    phase,
+                    robot_data.joint_pos - robot_data.default_joint_pos,
+                    robot_data.joint_vel - robot_data.default_joint_vel,
+                    last_action_buf,
+                ],
+                dim=-1,
+            )
+            height_map = lidar_accum() if lidar_accum is not None else None
+            obs = torch.cat([proprio, height_map], dim=-1) if height_map is not None else proprio
+            action = actor(obs)
+            last_action_buf.copy_(action)
+            return action
 
     elif args_cli.policy_path:
         # Exported TorchScript policy (e.g. a blind/recurrent run from a different
