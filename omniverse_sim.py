@@ -74,12 +74,15 @@ parser.add_argument(
 )
 parser.add_argument(
     "--waypoints", type=str, default=None,
-    help="Semicolon-separated x,y pairs in world coordinates to walk through in order, "
-         "e.g. '1,0;2,2;0,3'. Overrides keyboard control every step: base_command is set "
-         "each frame by steering toward the current waypoint (see _update_waypoint_command "
-         "in run_sim()) instead of waiting for WASD input. Robot must be at env_cfg.scene."
-         "robot's ENV_REGEX_NS origin's coordinate frame (env 0's world origin) — with a "
-         "single env this is just plain world x,y.",
+    help="Semicolon-separated x,y pairs to walk through in order, relative to each "
+         "robot's own env_origin (plain world x,y for a single env, since that's always "
+         "(0, 0)), e.g. '1,0;2,2;0,3'. Overrides keyboard control every step: base_command "
+         "is set each frame by steering toward the current waypoint (see "
+         "update_waypoint_command in run_sim()) instead of waiting for WASD input. With "
+         "--robot_amount > 1, '|' separates one list per robot in robot order, e.g. "
+         "'0,0;2,0|0,3;2,3' for 2 robots — a single list (no '|') is shared by every "
+         "robot, each independently tracking its own progress through it. Per-robot lists "
+         "may differ in length.",
 )
 parser.add_argument(
     "--waypoint_radius", type=float, default=0.3,
@@ -888,46 +891,88 @@ def run_sim():
     # frame from the robot's actual world pose (simple proportional heading/speed
     # controller — not a path planner, just enough to walk through a fixed list of
     # points instead of driving WASD by hand).
+    #
+    # Multi-robot (--robot_amount > 1): "|" separates one waypoint list per robot, e.g.
+    # --waypoints "0,0;2,0|0,3;2,3" walks robot 0 through the first list and robot 1
+    # through the second. A single list (no "|", the pre-existing syntax) is shared by
+    # every robot, each independently tracking its own progress through it — this is
+    # also exactly what already happened with --robot_amount 1, so that case's behavior
+    # is unchanged. Per-robot lists may differ in length; shorter ones hold at their own
+    # last point once reached (padded internally, not by repeating the last leg's walk).
+    # Coordinates are relative to each robot's own env_origin (== (0, 0) for a single
+    # env, so again no change there), not literal world xy — this is what makes the same
+    # list meaningful for every robot regardless of where IsaacLab's env grid places it.
     update_waypoint_command = None
     if args_cli.waypoints:
-        waypoints = [tuple(map(float, pair.split(","))) for pair in args_cli.waypoints.split(";")]
-        print(f"[go2_omniverse] waypoints: {waypoints}")
-        waypoint_robot = env.unwrapped.scene["robot"]
         num_wp_envs = env_cfg.scene.num_envs
-        waypoints_t = torch.tensor(waypoints, dtype=torch.float32, device=device)
+        groups = [
+            [tuple(map(float, pair.split(","))) for pair in group.split(";")]
+            for group in args_cli.waypoints.split("|")
+        ]
+        if len(groups) == 1:
+            groups = groups * num_wp_envs
+        elif len(groups) != num_wp_envs:
+            raise ValueError(
+                f"--waypoints has {len(groups)} '|'-separated lists but --robot_amount "
+                f"is {num_wp_envs}; give either exactly one list (shared by every robot) "
+                f"or exactly {num_wp_envs}."
+            )
+        print(f"[go2_omniverse] waypoints per robot: {groups}")
+        waypoint_robot = env.unwrapped.scene["robot"]
+        env_origins_xy = env.unwrapped.scene.env_origins[:, :2]
+        max_len = max(len(g) for g in groups)
+        last_wp_t = torch.tensor([len(g) - 1 for g in groups], dtype=torch.long, device=device)
+        waypoints_t = torch.stack(
+            [
+                torch.tensor(g + [g[-1]] * (max_len - len(g)), dtype=torch.float32, device=device)
+                for g in groups
+            ]
+        )  # (num_wp_envs, max_len, 2), local (env-relative) coordinates
         waypoint_idx = torch.zeros(num_wp_envs, dtype=torch.long, device=device)
-        last_wp = len(waypoints) - 1
+        robot_idx = torch.arange(num_wp_envs, device=device)
 
-        # Static markers at each waypoint (z fixed just above ground level — good enough
-        # for the flat custom envs this is used with): grey = already passed, green =
+        # Static markers per robot (z fixed just above ground level — good enough for
+        # the flat custom envs this is used with): grey = already passed, green =
         # current target, blue = still ahead. Re-drawn every step so the colors track
-        # waypoint_idx as env 0 (the only one considered here) advances.
+        # each robot's own waypoint_idx. One VisualizationMarkers per robot (separate
+        # prim path) so overlapping/differing per-robot paths stay visually distinct.
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-        waypoint_vis = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/Waypoints",
-                markers={
-                    "pending": sim_utils.SphereCfg(
-                        radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.4, 1.0))
-                    ),
-                    "current": sim_utils.SphereCfg(
-                        radius=0.12, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1))
-                    ),
-                    "done": sim_utils.SphereCfg(
-                        radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5))
-                    ),
-                },
+        def _make_waypoint_vis(i: int) -> VisualizationMarkers:
+            return VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path=f"/Visuals/Waypoints/robot_{i}",
+                    markers={
+                        "pending": sim_utils.SphereCfg(
+                            radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.4, 1.0))
+                        ),
+                        "current": sim_utils.SphereCfg(
+                            radius=0.12, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1))
+                        ),
+                        "done": sim_utils.SphereCfg(
+                            radius=0.08, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5))
+                        ),
+                    },
+                )
             )
-        )
+
+        waypoint_vis = [_make_waypoint_vis(i) for i in range(num_wp_envs)]
         waypoint_translations = torch.cat(
-            [waypoints_t, torch.full((len(waypoints), 1), 0.05, device=device)], dim=-1
-        )
+            [
+                waypoints_t + env_origins_xy.unsqueeze(1),
+                torch.full((num_wp_envs, max_len, 1), 0.05, device=device),
+            ],
+            dim=-1,
+        )  # (num_wp_envs, max_len, 3), world coordinates
 
         def draw_waypoints():
-            idx = int(waypoint_idx[0].item())
-            marker_indices = [2 if i < idx else 1 if i == idx else 0 for i in range(len(waypoints))]
-            waypoint_vis.visualize(waypoint_translations, marker_indices=torch.tensor(marker_indices, device=device))
+            for i in range(num_wp_envs):
+                idx = int(waypoint_idx[i].item())
+                n = int(last_wp_t[i].item()) + 1
+                marker_indices = [2 if j < idx else 1 if j == idx else 0 for j in range(n)]
+                waypoint_vis[i].visualize(
+                    waypoint_translations[i, :n], marker_indices=torch.tensor(marker_indices, device=device)
+                )
 
         last_xy_print = 0.0
 
@@ -937,15 +982,16 @@ def run_sim():
             now = time.time()
             if now - last_xy_print >= 5.0:
                 last_xy_print = now
-                xy = waypoint_robot.data.root_pos_w[0, :2].tolist()
-                print(f"[go2_omniverse] xy = ({xy[0]:.2f}, {xy[1]:.2f})")
+                xy_all = waypoint_robot.data.root_pos_w[:, :2].tolist()
+                xy_str = ", ".join(f"[{i}]=({x:.2f}, {y:.2f})" for i, (x, y) in enumerate(xy_all))
+                print(f"[go2_omniverse] xy = {xy_str}")
             if time.time() - start_time < args_cli.waypoint_delay:
                 for i in range(num_wp_envs):
                     custom_rl_env.base_command[str(i)] = [0.0, 0.0, 0.0]
                 return
             pos = waypoint_robot.data.root_pos_w[:, :2]
             heading = waypoint_robot.data.heading_w
-            target = waypoints_t[waypoint_idx]
+            target = waypoints_t[robot_idx, waypoint_idx] + env_origins_xy
             delta = target - pos
             dist = torch.linalg.norm(delta, dim=-1)
             desired_heading = torch.atan2(delta[:, 1], delta[:, 0])
@@ -954,11 +1000,16 @@ def run_sim():
             )
 
             arrived = dist < args_cli.waypoint_radius
-            finished = arrived & (waypoint_idx == last_wp) if not args_cli.waypoint_loop else torch.zeros_like(arrived)
+            finished = (
+                arrived & (waypoint_idx == last_wp_t) if not args_cli.waypoint_loop else torch.zeros_like(arrived)
+            )
             if args_cli.waypoint_loop:
-                waypoint_idx[arrived] = (waypoint_idx[arrived] + 1) % len(waypoints)
+                waypoint_idx[arrived] = torch.where(
+                    waypoint_idx[arrived] == last_wp_t[arrived], torch.zeros_like(waypoint_idx[arrived]),
+                    waypoint_idx[arrived] + 1,
+                )
             else:
-                waypoint_idx[arrived] = torch.clamp(waypoint_idx[arrived] + 1, max=last_wp)
+                waypoint_idx[arrived] = torch.clamp(waypoint_idx[arrived] + 1, max=last_wp_t[arrived])
 
             # slow down inside the arrival radius instead of overshooting at full speed
             speed_cap = torch.clamp(
