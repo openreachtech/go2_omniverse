@@ -1,0 +1,20 @@
+# Fleet-wide vehicle traits and arrival tolerance for go2_omniverse's Go2 fleet.
+#
+# linear_velocity matches omniverse_sim.py's --waypoint_speed default (0.8 m/s) so RMF's
+# own timing estimates agree with what the sim's proportional controller can actually
+# deliver. waypoint_radius matches --waypoint_radius's default for the same reason.
+fleet_name: go2_fleet
+linear_velocity: 0.8
+linear_acceleration: 1.0
+angular_velocity: 1.2
+angular_acceleration: 1.5
+# 0.35/0.5 (realistic Go2-ish size) let two simultaneous, exactly-tied arrivals slip
+# through unflagged; 0.5/1.5 overcorrected — the vicinity bubble became wide enough to
+# cover most of each 3 m approach leg, so the two robots' *entire* paths registered as
+# conflicting and one waited out the other's whole journey instead of just the
+# intersection itself. Splitting the difference here, combined with fleet_adapter.py's
+# staggered dispatch (breaking the exact tie so there's an unambiguous "first" robot),
+# should keep the hold localized to the intersection.
+footprint_radius: 0.35
+vicinity_radius: 0.6
+waypoint_radius: 0.3

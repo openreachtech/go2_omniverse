@@ -77,6 +77,15 @@ _STUDIO_HDRI = _find_studio_hdri()
 
 base_command = {}
 
+# --rmf_control: filled in by ros2.py's RobotBaseNode subscriptions to
+# robot<i>/rmf_target (geometry_msgs/PoseStamped) and robot<i>/rmf_hold
+# (std_msgs/Bool), published by go2_omniverse_ws/src/go2_rmf_adapter's fleet adapter.
+# Read by omniverse_sim.py's update_waypoint_command when --rmf_control is set, in
+# place of a static --waypoints list. rmf_hold defaults to True (stand still) until a
+# message actually arrives, so a robot never wanders before the RMF side is connected.
+rmf_target = {}
+rmf_hold = {}
+
 
 def constant_commands(env: ManagerBasedRLEnvCfg) -> torch.Tensor:
     global base_command

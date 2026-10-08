@@ -1,0 +1,59 @@
+# Hand-authored nav graph for the go2_omniverse flat-terrain MVP demo: a symmetric "+"
+# intersection at the world origin. Robot "0" spawns west of it facing east and walks
+# straight through to the east side; robot "1" spawns north of it facing south and
+# walks straight through to the south side — perpendicular to robot "0", both the same
+# distance from the centre, both walking straight in (no turning, unlike an earlier
+# version of this graph).
+#
+# These coordinates are literal world coordinates, not env-relative: omniverse_sim.py's
+# --rmf_control branch overrides both robots' spawn pose to exactly this layout
+# (rmf_spawn_dist / rmf_spawn_layout, right after env.get_observations() in run_sim()) —
+# IsaacLab's own env grid would otherwise place them both on the same line via
+# env_spacing, which is what a prior version of this demo got wrong. If rmf_spawn_dist
+# there ever changes, wp_r0_start/wp_r1_start below must change with it.
+map_name: go2_test
+
+waypoints:
+  - name: wp_r0_start
+    x: -3.0
+    y: 0.0
+    is_holding_point: true
+  - name: wp_r1_start
+    x: 0.0
+    y: 3.0
+    is_holding_point: true
+  - name: wp_center
+    x: 0.0
+    y: 0.0
+    is_holding_point: true
+  - name: wp_east_exit
+    x: 3.0
+    y: 0.0
+    # RMF requires at least one charging waypoint per fleet (FleetUpdateHandle::add_robot
+    # throws otherwise) even though nothing here actually models battery charging.
+    is_charger: true
+    is_holding_point: true
+  - name: wp_south_exit
+    x: 0.0
+    y: -3.0
+    is_holding_point: true
+
+# Bidirectional lanes, by waypoint name. wp_center carries both the east-west lane
+# (robot "0"'s route) and the north-south lane (robot "1"'s route), which is what
+# makes it the "+" intersection both robots' paths genuinely share.
+lanes:
+  - [wp_r0_start, wp_center]
+  - [wp_center, wp_east_exit]
+  - [wp_r1_start, wp_center]
+  - [wp_center, wp_south_exit]
+
+# Each robot's own spawn waypoint and the far-end waypoint it walks to. Robot "0"
+# crosses west-to-east through wp_center; robot "1" crosses north-to-south through the
+# same point, perpendicular to robot "0".
+robots:
+  - name: "0"
+    start_waypoint: wp_r0_start
+    goal_waypoint: wp_east_exit
+  - name: "1"
+    start_waypoint: wp_r1_start
+    goal_waypoint: wp_south_exit

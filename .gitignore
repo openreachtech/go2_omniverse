@@ -8,3 +8,4 @@ IsaacSim-ros_workspaces/build_ws
 envs
 logs/
 robots/
+*.mp4

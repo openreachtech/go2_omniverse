@@ -105,6 +105,18 @@ parser.add_argument(
          "livestream viewport time to finish loading before the robot starts moving.",
 )
 parser.add_argument(
+    "--rmf_control", action="store_true", default=False,
+    help="Drive base_command from Open-RMF instead of a static --waypoints list: reads "
+         "custom_rl_env.rmf_target/rmf_hold (filled in by ros2.py's RobotBaseNode "
+         "subscriptions to robot<i>/rmf_target and robot<i>/rmf_hold, published by "
+         "go2_omniverse_ws/src/go2_rmf_adapter's fleet adapter — a separate process "
+         "under a full system ROS 2 install, since RMF needs colcon/custom msgs that "
+         "Isaac Sim's bundled rclpy doesn't have) through the exact same proportional "
+         "heading/speed controller --waypoints uses. Mutually exclusive with "
+         "--waypoints. Every robot stands still (rmf_hold defaults True) until the RMF "
+         "side actually connects.",
+)
+parser.add_argument(
     "--record_video", type=str, default=None,
     help="Path to write an MP4 recording to (e.g. /tmp/run.mp4), via a dedicated world-space "
          "Camera piped to ffmpeg — sharper than screen-recording the (compressed) livestream. "
@@ -835,6 +847,29 @@ def run_sim():
     obs = env.get_observations()
     _ckpt("env.get_observations: done")
 
+    if args_cli.rmf_control and env_cfg.scene.num_envs == 2:
+        # Symmetric "+" intersection demo spawn layout (see go2_omniverse_ws/src/
+        # go2_rmf_adapter/config/nav_graph.yaml, which assumes exactly this layout):
+        # robot "0" west of the intersection facing east, robot "1" north of it facing
+        # south, both the same distance out — overrides wherever IsaacLab's env grid
+        # (env_spacing, both robots on the same line) would otherwise place them.
+        rmf_spawn_robot = env.unwrapped.scene["robot"]
+        rmf_spawn_dist = 3.0
+        rmf_spawn_layout = {
+            0: ((-rmf_spawn_dist, 0.0), 0.0),              # west, facing east (+x)
+            1: ((0.0, rmf_spawn_dist), -math.pi / 2.0),    # north, facing south (-y)
+        }
+        rmf_spawn_pose = rmf_spawn_robot.data.root_pos_w.new_zeros(env_cfg.scene.num_envs, 7)
+        rmf_spawn_pose[:, 2] = rmf_spawn_robot.data.root_pos_w[:, 2]
+        for rmf_spawn_i, ((rmf_spawn_x, rmf_spawn_y), rmf_spawn_yaw) in rmf_spawn_layout.items():
+            rmf_spawn_pose[rmf_spawn_i, 0] = rmf_spawn_x
+            rmf_spawn_pose[rmf_spawn_i, 1] = rmf_spawn_y
+            rmf_spawn_pose[rmf_spawn_i, 3] = math.cos(rmf_spawn_yaw / 2.0)  # w
+            rmf_spawn_pose[rmf_spawn_i, 6] = math.sin(rmf_spawn_yaw / 2.0)  # z
+        rmf_spawn_robot.write_root_pose_to_sim(rmf_spawn_pose)
+        _ckpt(f"--rmf_control: repositioned robots for the intersection demo "
+              f"(robot 0 west-facing-east, robot 1 north-facing-south, {rmf_spawn_dist}m out)")
+
     # initialize ROS2 node
     _ckpt("rclpy.init + RobotBaseNode")
     rclpy.init()
@@ -902,6 +937,9 @@ def run_sim():
     # Coordinates are relative to each robot's own env_origin (== (0, 0) for a single
     # env, so again no change there), not literal world xy — this is what makes the same
     # list meaningful for every robot regardless of where IsaacLab's env grid places it.
+    if args_cli.waypoints and args_cli.rmf_control:
+        raise ValueError("--waypoints and --rmf_control are mutually exclusive.")
+
     update_waypoint_command = None
     if args_cli.waypoints:
         num_wp_envs = env_cfg.scene.num_envs
@@ -1023,6 +1061,38 @@ def run_sim():
 
             for i in range(num_wp_envs):
                 custom_rl_env.base_command[str(i)] = [lin_vel_x[i].item(), 0.0, ang_vel_z[i].item()]
+
+    elif args_cli.rmf_control:
+        # Same proportional heading/speed controller as --waypoints above, just reading
+        # its target from Open-RMF (via ros2.py's rmf_target/rmf_hold subscriptions)
+        # instead of a static list — see go2_omniverse_ws/src/go2_rmf_adapter.
+        rmf_robot = env.unwrapped.scene["robot"]
+        num_rmf_envs = env_cfg.scene.num_envs
+
+        def update_waypoint_command():
+            pos = rmf_robot.data.root_pos_w[:, :2]
+            heading = rmf_robot.data.heading_w
+            for i in range(num_rmf_envs):
+                key = str(i)
+                target_xy_yaw = custom_rl_env.rmf_target.get(key)
+                hold = custom_rl_env.rmf_hold.get(key, True)
+                if target_xy_yaw is None or hold:
+                    custom_rl_env.base_command[key] = [0.0, 0.0, 0.0]
+                    continue
+                tx, ty, _ = target_xy_yaw
+                dx, dy = tx - pos[i, 0].item(), ty - pos[i, 1].item()
+                dist = math.hypot(dx, dy)
+                desired_heading = math.atan2(dy, dx)
+                heading_error = math.atan2(
+                    math.sin(desired_heading - heading[i].item()), math.cos(desired_heading - heading[i].item())
+                )
+                speed_cap = min(
+                    dist / max(args_cli.waypoint_radius, 1e-3) * args_cli.waypoint_speed,
+                    args_cli.waypoint_speed,
+                )
+                lin_vel_x = speed_cap * max(math.cos(heading_error), 0.0)
+                ang_vel_z = max(min(heading_error * 2.0, 1.2), -1.2)
+                custom_rl_env.base_command[key] = [lin_vel_x, 0.0, ang_vel_z]
 
     if args_cli.capture > 0:
         capture_hero_shots(env, policy, obs, device, args_cli.capture, args_cli.capture_dir)
@@ -1149,6 +1219,12 @@ def run_sim():
                 # Kinematic playback — bypasses PD/gravity for an exact mirror.
                 twin.apply(device)
             pub_robo_data_ros2(args_cli.robot, env_cfg.scene.num_envs, base_node, env, annotator_lst, start_time)
+            # base_node only ever had publishers before --rmf_control added
+            # subscriptions (robot<i>/rmf_target, robot<i>/rmf_hold) to it — publishing
+            # doesn't need spinning, so this was never necessary until now. Without it,
+            # those callbacks never fire and rmf_hold stays stuck at its init-time
+            # default (True) forever, which looks exactly like "the robot never moves".
+            rclpy.spin_once(base_node, timeout_sec=0)
     if record_state is not None:
         finalize_recording()
         print(f"[go2_omniverse] recording finalized: {args_cli.record_video}")

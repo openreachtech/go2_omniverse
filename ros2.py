@@ -9,9 +9,9 @@ import numpy as np
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf2_msgs.msg import TFMessage
-from std_msgs.msg import Header, Float32MultiArray
+from std_msgs.msg import Bool, Header, Float32MultiArray
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, PointField, Imu
@@ -21,6 +21,8 @@ from isaacsim.sensors.rtx import LidarRtx
 import omni.replicator.core as rep
 from scipy.spatial.transform import Rotation
 import isaaclab.sim as sim_utils
+
+import custom_rl_env
 
 
 def _to_numpy(arr):
@@ -171,8 +173,35 @@ class RobotBaseNode(Node):
             self.go2_lidar_pub.append(self.create_publisher(PointCloud2, f'robot{i}/point_cloud2', qos_profile))
             self.odom_pub.append(self.create_publisher(Odometry, f'robot{i}/odom', qos_profile))
             self.imu_pub.append(self.create_publisher(Imu, f'robot{i}/imu', qos_profile))
+            # --rmf_control: fed by go2_omniverse_ws/src/go2_rmf_adapter's fleet adapter
+            # (a separate process under system ROS 2 Humble, where RMF itself lives —
+            # see that package's README). custom_rl_env.rmf_hold defaults to True so a
+            # robot stands still until the RMF side actually connects.
+            custom_rl_env.rmf_hold[str(i)] = True
+            self.create_subscription(
+                PoseStamped, f'robot{i}/rmf_target',
+                self._make_rmf_target_cb(str(i)), qos_profile,
+            )
+            self.create_subscription(
+                Bool, f'robot{i}/rmf_hold',
+                self._make_rmf_hold_cb(str(i)), qos_profile,
+            )
         # Publish TF as tf2_msgs/TFMessage on /tf — avoids tf2_ros dependency
         self.tf_pub = self.create_publisher(TFMessage, '/tf', qos_profile)
+
+    @staticmethod
+    def _make_rmf_target_cb(robot_id: str):
+        def cb(msg: PoseStamped):
+            q = msg.pose.orientation
+            yaw = 2.0 * np.arctan2(q.z, q.w)
+            custom_rl_env.rmf_target[robot_id] = (msg.pose.position.x, msg.pose.position.y, float(yaw))
+        return cb
+
+    @staticmethod
+    def _make_rmf_hold_cb(robot_id: str):
+        def cb(msg: Bool):
+            custom_rl_env.rmf_hold[robot_id] = bool(msg.data)
+        return cb
 
     def publish_joints(self, joint_names_lst, joint_state_lst, robot_num):
         joint_state = JointState()
